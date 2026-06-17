@@ -2,6 +2,7 @@ import os
 import sys
 import threading
 import time
+import hashlib
 from datetime import datetime
 import customtkinter as ctk
 import json
@@ -34,11 +35,17 @@ class ImageSaverApp(ctk.CTk):
         # Build UI Elements
         self.init_ui()
         
-        # Clipboard monitor background thread management
+        # Clipboard monitor: 백그라운드 스레드는 신호만 보냄
+        # 실제 grabclipboard()는 메인 스레드(after 콜백)에서만 호출
         self.running = True
-        self.last_clipboard_image = None
-        self.monitor_thread = threading.Thread(target=self.monitor_clipboard, daemon=True)
+        self.last_image_hash = None  # 이미지 해시 기반 중복 체크
+        self._check_clipboard_requested = False  # 스레드→메인 신호 플래그
+
+        self.monitor_thread = threading.Thread(target=self._monitor_tick, daemon=True)
         self.monitor_thread.start()
+
+        # 메인 스레드에서 주기적으로 클립보드 체크
+        self._schedule_clipboard_check()
 
         # Keyboard Bindings (Ctrl+V)
         self.bind("<Control-v>", self.on_ctrl_v)
@@ -46,6 +53,45 @@ class ImageSaverApp(ctk.CTk):
         
         self.log_action("프로그램이 실행되었습니다. 저장 경로를 확인하세요.")
         self.update_image_counter()
+
+    def _monitor_tick(self):
+        """백그라운드 스레드: 500ms마다 신호만 보냄 (grabclipboard 직접 호출 X)"""
+        while self.running:
+            if self.auto_save_var.get() == "on":
+                self._check_clipboard_requested = True
+            time.sleep(0.5)
+
+    def _schedule_clipboard_check(self):
+        """메인 스레드에서 클립보드 실제 체크 (COM 안전)"""
+        if self.running:
+            if self._check_clipboard_requested:
+                self._check_clipboard_requested = False
+                self._grab_and_save_if_new()
+            # 500ms 후 다시 예약
+            self.after(500, self._schedule_clipboard_check)
+
+    def _grab_and_save_if_new(self):
+        """메인 스레드에서 안전하게 클립보드 이미지 읽기"""
+        try:
+            img = ImageGrab.grabclipboard()
+            if isinstance(img, Image.Image):
+                img_hash = self._image_hash(img)
+                if img_hash != self.last_image_hash:
+                    self.last_image_hash = img_hash
+                    self.save_image(img)
+        except Exception as e:
+            # 간헐적 COM/클립보드 오류 로깅 (조용히 무시하지 않음)
+            self.log_action(f"[자동감지 오류] {str(e)}")
+
+    def _image_hash(self, img):
+        """이미지 해시 (크기+샘플 픽셀 기반, 빠르고 안정적)"""
+        try:
+            # 작은 크기로 리샘플 후 해시 → 빠르고 메모리 절약
+            thumb = img.copy()
+            thumb.thumbnail((64, 64))
+            return hashlib.md5(thumb.tobytes()).hexdigest()
+        except Exception:
+            return None
 
     def init_ui(self):
         # Header Layout
@@ -145,7 +191,16 @@ class ImageSaverApp(ctk.CTk):
             try:
                 with open(CONFIG_FILE, "r", encoding="utf-8") as f:
                     config = json.load(f)
-                    self.save_dir = os.path.abspath(config.get("save_dir", self.save_dir))
+                    loaded_dir = os.path.abspath(config.get("save_dir", self.save_dir))
+
+                    # 드라이브/경로 유효성 검사: 존재하지 않는 드라이브면 기본 경로로 리셋
+                    drive = os.path.splitdrive(loaded_dir)[0]
+                    if drive and not os.path.exists(drive + "\\"):
+                        print(f"[경고] 저장 경로의 드라이브({drive})가 없습니다. 기본 경로로 초기화합니다.")
+                        self.save_dir = os.path.abspath("./dataset")
+                    else:
+                        self.save_dir = loaded_dir
+
                     self.file_prefix = config.get("file_prefix", self.file_prefix)
                     self.start_index = config.get("start_index", self.start_index)
             except Exception as e:
@@ -207,38 +262,22 @@ class ImageSaverApp(ctk.CTk):
         try:
             img = ImageGrab.grabclipboard()
             if isinstance(img, Image.Image):
+                img_hash = self._image_hash(img)
+                self.last_image_hash = img_hash  # 수동 저장 후 중복 방지
                 self.save_image(img)
             else:
                 self.log_action("오류: 클립보드에 이미지가 없습니다.")
         except Exception as e:
             self.log_action(f"클립보드 읽기 에러: {str(e)}")
 
-    # Monitor clipboard in background loop thread
-    def monitor_clipboard(self):
-        while self.running:
-            if self.auto_save_var.get() == "on":
-                try:
-                    img = ImageGrab.grabclipboard()
-                    if isinstance(img, Image.Image):
-                        # Simple comparison check to avoid saving same image indefinitely
-                        if self.last_clipboard_image is None or not self.images_are_equal(img, self.last_clipboard_image):
-                            self.last_clipboard_image = img
-                            # Call save_image in the main Tkinter thread safely
-                            self.after(0, self.save_image, img)
-                except Exception:
-                    pass
-            time.sleep(0.5)
-
-    def images_are_equal(self, img1, img2):
-        try:
-            return img1.size == img2.size and img1.tobytes() == img2.tobytes()
-        except Exception:
-            return False
-
     # Save logic
     def save_image(self, img):
         if not os.path.exists(self.save_dir):
-            os.makedirs(self.save_dir)
+            try:
+                os.makedirs(self.save_dir)
+            except Exception as e:
+                self.log_action(f"폴더 생성 실패: {str(e)}")
+                return
 
         # Get unique sequence filename
         while True:
@@ -252,7 +291,6 @@ class ImageSaverApp(ctk.CTk):
 
         # Show thumbnail preview
         try:
-            # Resize image keeping aspect ratio
             max_w, max_h = 320, 240
             preview_img = img.copy()
             preview_img.thumbnail((max_w, max_h), Image.Resampling.LANCZOS if hasattr(Image, 'Resampling') else Image.ANTIALIAS)
