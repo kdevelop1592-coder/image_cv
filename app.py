@@ -40,6 +40,7 @@ class ImageSaverApp(ctk.CTk):
         self.running = True
         self.last_image_hash = None  # 이미지 해시 기반 중복 체크
         self._check_clipboard_requested = False  # 스레드→메인 신호 플래그
+        self._auto_save_enabled = True  # ✅ 스레드 안전 bool (StringVar 대신 사용)
 
         self.monitor_thread = threading.Thread(target=self._monitor_tick, daemon=True)
         self.monitor_thread.start()
@@ -57,7 +58,7 @@ class ImageSaverApp(ctk.CTk):
     def _monitor_tick(self):
         """백그라운드 스레드: 500ms마다 신호만 보냄 (grabclipboard 직접 호출 X)"""
         while self.running:
-            if self.auto_save_var.get() == "on":
+            if self._auto_save_enabled:  # ✅ bool 플래그 읽기 (Tkinter StringVar 접근 X)
                 self._check_clipboard_requested = True
             time.sleep(0.5)
 
@@ -71,17 +72,31 @@ class ImageSaverApp(ctk.CTk):
             self.after(500, self._schedule_clipboard_check)
 
     def _grab_and_save_if_new(self):
-        """메인 스레드에서 안전하게 클립보드 이미지 읽기"""
-        try:
-            img = ImageGrab.grabclipboard()
-            if isinstance(img, Image.Image):
-                img_hash = self._image_hash(img)
-                if img_hash != self.last_image_hash:
-                    self.last_image_hash = img_hash
-                    self.save_image(img)
-        except Exception as e:
-            # 간헐적 COM/클립보드 오류 로깅 (조용히 무시하지 않음)
-            self.log_action(f"[자동감지 오류] {str(e)}")
+        """메인 스레드에서 안전하게 클립보드 이미지 읽기 (재시도 포함)"""
+        img = None
+        last_err = None
+        # 클립보드 읽기 최대 3회 재시도 (Win+Shift+S 직후 아직 기록 중일 수 있음)
+        for attempt in range(3):
+            try:
+                img = ImageGrab.grabclipboard()
+                if img is not None:
+                    break  # 성공
+            except Exception as e:
+                last_err = e
+            time.sleep(0.15)  # 150ms 대기 후 재시도
+
+        if last_err and img is None:
+            self.log_action(f"[자동감지 오류] {str(last_err)}")
+            return
+
+        if isinstance(img, Image.Image):
+            img_hash = self._image_hash(img)
+            if img_hash != self.last_image_hash:
+                self.last_image_hash = img_hash
+                self.save_image(img)
+        elif isinstance(img, list):
+            # 파일 경로 리스트인 경우 (드래그앤드롭 등) — 무시
+            pass
 
     def _image_hash(self, img):
         """이미지 해시 (크기+샘플 픽셀 기반, 빠르고 안정적)"""
@@ -165,7 +180,11 @@ class ImageSaverApp(ctk.CTk):
 
         # Auto save toggle
         self.auto_save_var = ctk.StringVar(value="on")
-        self.auto_save_switch = ctk.CTkSwitch(settings_frame, text="실시간 자동 감지 저장", variable=self.auto_save_var, onvalue="on", offvalue="off")
+        self.auto_save_switch = ctk.CTkSwitch(
+            settings_frame, text="실시간 자동 감지 저장",
+            variable=self.auto_save_var, onvalue="on", offvalue="off",
+            command=self._on_auto_save_toggle  # ✅ 스위치 변경 시 bool 플래그 동기화
+        )
         self.auto_save_switch.grid(row=4, column=0, padx=15, pady=10, sticky="w")
 
         # Bottom Section: Logs History
@@ -185,6 +204,12 @@ class ImageSaverApp(ctk.CTk):
         
         creator_lbl = ctk.CTkLabel(self, text="제작자: 코드깎는 kd", font=ctk.CTkFont(size=11, weight="bold"), text_color="#48C9B0")
         creator_lbl.grid(row=4, column=0, padx=20, pady=(2, 10), sticky="e")
+
+    def _on_auto_save_toggle(self):
+        """스위치 토글 시 메인 스레드에서 bool 플래그 동기화 (스레드 안전)"""
+        self._auto_save_enabled = (self.auto_save_var.get() == "on")
+        state = "활성화" if self._auto_save_enabled else "비활성화"
+        self.log_action(f"자동 감지 저장 {state}")
 
     def load_config(self):
         if os.path.exists(CONFIG_FILE):
@@ -275,9 +300,22 @@ class ImageSaverApp(ctk.CTk):
         if not os.path.exists(self.save_dir):
             try:
                 os.makedirs(self.save_dir)
+                self.log_action(f"저장 폴더 생성: {self.save_dir}")
             except Exception as e:
                 self.log_action(f"폴더 생성 실패: {str(e)}")
                 return
+
+        # 이미지 모드 자동 변환 (RGBA/P → RGB → PNG 저장 가능)
+        try:
+            if img.mode in ("RGBA", "LA"):
+                # 투명 배경을 흰색으로 합성
+                bg = Image.new("RGB", img.size, (255, 255, 255))
+                bg.paste(img, mask=img.split()[-1])
+                img = bg
+            elif img.mode not in ("RGB", "L"):
+                img = img.convert("RGB")
+        except Exception as conv_err:
+            self.log_action(f"[경고] 이미지 모드 변환 실패 ({img.mode}): {conv_err}")
 
         # Get unique sequence filename
         while True:
@@ -286,8 +324,6 @@ class ImageSaverApp(ctk.CTk):
             if not os.path.exists(filepath):
                 break
             self.start_index += 1
-            self.index_entry.delete(0, ctk.END)
-            self.index_entry.insert(0, str(self.start_index))
 
         # Show thumbnail preview
         try:
@@ -301,22 +337,37 @@ class ImageSaverApp(ctk.CTk):
         except Exception as preview_err:
             self.log_action(f"미리보기 로드 오류: {preview_err}")
 
-        # Save to disk
-        try:
-            img.save(filepath, "PNG")
+        # Save to disk — 최대 3회 재시도 (백신/클라우드 동기화 잠금 대응)
+        saved = False
+        last_save_err = None
+        for attempt in range(3):
+            try:
+                img.save(filepath, "PNG")
+                saved = True
+                break
+            except Exception as e:
+                last_save_err = e
+                time.sleep(0.2)  # 200ms 대기 후 재시도
+
+        if saved:
             self.log_action(f"저장 성공: {filename}")
-            
             # Auto increment sequence index
             self.start_index += 1
             self.index_entry.delete(0, ctk.END)
             self.index_entry.insert(0, str(self.start_index))
             self.update_image_counter()
             self.save_config()
-
             self.status_lbl.configure(text=f"최근 저장 완료: {filename} ({datetime.now().strftime('%M:%S')})", text_color="#2ecc71")
-        except Exception as e:
-            self.log_action(f"저장 실패: {str(e)}")
-            self.status_lbl.configure(text="이미지 저장 중 오류 발생", text_color="#e74c3c")
+        else:
+            err_type = type(last_save_err).__name__
+            err_msg = str(last_save_err)
+            self.log_action(f"❌ 저장 실패 (3회 시도 후 포기) [{err_type}]: {err_msg}")
+            self.log_action(f"   경로: {filepath}")
+            if isinstance(last_save_err, PermissionError):
+                self.status_lbl.configure(text="⚠ 저장 실패: 파일이 잠겨 있습니다 (백신/OneDrive 확인)", text_color="#e74c3c")
+            else:
+                self.status_lbl.configure(text=f"⚠ 저장 실패: {err_msg[:60]}", text_color="#e74c3c")
+            self.bell()  # 시스템 경고음으로 실패 알림
 
     def destroy(self):
         self.running = False
