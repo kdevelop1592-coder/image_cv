@@ -91,9 +91,10 @@ class ImageSaverApp(ctk.CTk):
 
         if isinstance(img, Image.Image):
             img_hash = self._image_hash(img)
-            if img_hash != self.last_image_hash:
-                self.last_image_hash = img_hash
-                self.save_image(img)
+            # img_hash가 None인 경우(해시 계산 실패)도 저장 시도
+            # last_image_hash 갱신은 저장 성공 후 save_image() 내부에서 수행
+            if img_hash is None or img_hash != self.last_image_hash:
+                self.save_image(img, img_hash)
         elif isinstance(img, list):
             # 파일 경로 리스트인 경우 (드래그앤드롭 등) — 무시
             pass
@@ -288,15 +289,15 @@ class ImageSaverApp(ctk.CTk):
             img = ImageGrab.grabclipboard()
             if isinstance(img, Image.Image):
                 img_hash = self._image_hash(img)
-                self.last_image_hash = img_hash  # 수동 저장 후 중복 방지
-                self.save_image(img)
+                # 저장 성공 후 save_image() 내부에서 해시 갱신
+                self.save_image(img, img_hash)
             else:
                 self.log_action("오류: 클립보드에 이미지가 없습니다.")
         except Exception as e:
             self.log_action(f"클립보드 읽기 에러: {str(e)}")
 
     # Save logic
-    def save_image(self, img):
+    def save_image(self, img, img_hash=None):
         if not os.path.exists(self.save_dir):
             try:
                 os.makedirs(self.save_dir)
@@ -350,6 +351,8 @@ class ImageSaverApp(ctk.CTk):
                 time.sleep(0.2)  # 200ms 대기 후 재시도
 
         if saved:
+            # ✅ 저장 성공 후에만 해시 갱신 — 실패 시 다음 폴링에서 재시도 가능
+            self.last_image_hash = img_hash
             self.log_action(f"저장 성공: {filename}")
             # Auto increment sequence index
             self.start_index += 1
@@ -363,8 +366,9 @@ class ImageSaverApp(ctk.CTk):
             err_msg = str(last_save_err)
             self.log_action(f"❌ 저장 실패 (3회 시도 후 포기) [{err_type}]: {err_msg}")
             self.log_action(f"   경로: {filepath}")
+            # ✅ 저장 실패 시 해시를 갱신하지 않음 → 다음 폴링에서 자동 재시도
             if isinstance(last_save_err, PermissionError):
-                self.status_lbl.configure(text="⚠ 저장 실패: 파일이 잠겨 있습니다 (백신/OneDrive 확인)", text_color="#e74c3c")
+                self.status_lbl.configure(text="⚠ 저장 실패: 파일 접근 권한 오류", text_color="#e74c3c")
             else:
                 self.status_lbl.configure(text=f"⚠ 저장 실패: {err_msg[:60]}", text_color="#e74c3c")
             self.bell()  # 시스템 경고음으로 실패 알림
