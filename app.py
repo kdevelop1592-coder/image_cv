@@ -100,12 +100,13 @@ class ImageSaverApp(ctk.CTk):
             pass
 
     def _image_hash(self, img):
-        """이미지 해시 (크기+샘플 픽셀 기반, 빠르고 안정적)"""
+        """이미지 해시 — img.copy() 없이 직접 리샘플하여 메모리 절약"""
         try:
-            # 작은 크기로 리샘플 후 해시 → 빠르고 메모리 절약
-            thumb = img.copy()
-            thumb.thumbnail((64, 64))
-            return hashlib.md5(thumb.tobytes()).hexdigest()
+            # copy() 없이 썸네일 생성 (저RAM 대응)
+            thumb = img.resize((64, 64), Image.Resampling.LANCZOS if hasattr(Image, 'Resampling') else Image.ANTIALIAS)
+            digest = hashlib.md5(thumb.tobytes()).hexdigest()
+            del thumb  # 즉시 해제
+            return digest
         except Exception:
             return None
 
@@ -326,13 +327,15 @@ class ImageSaverApp(ctk.CTk):
                 break
             self.start_index += 1
 
-        # Show thumbnail preview
+        # Show thumbnail preview (copy() 없이 직접 resize → 저RAM 대응)
         try:
             max_w, max_h = 320, 240
-            preview_img = img.copy()
-            preview_img.thumbnail((max_w, max_h), Image.Resampling.LANCZOS if hasattr(Image, 'Resampling') else Image.ANTIALIAS)
-            
+            ratio = min(max_w / img.width, max_h / img.height)
+            new_size = (int(img.width * ratio), int(img.height * ratio))
+            resample = Image.Resampling.LANCZOS if hasattr(Image, 'Resampling') else Image.ANTIALIAS
+            preview_img = img.resize(new_size, resample)
             ctk_img = ctk.CTkImage(light_image=preview_img, dark_image=preview_img, size=preview_img.size)
+            del preview_img  # CTkImage 생성 후 즉시 해제
             self.preview_lbl.configure(image=ctk_img, text="")
             self.preview_lbl.image = ctk_img  # Reference retention
         except Exception as preview_err:
@@ -349,6 +352,8 @@ class ImageSaverApp(ctk.CTk):
             except Exception as e:
                 last_save_err = e
                 time.sleep(0.2)  # 200ms 대기 후 재시도
+
+        del img  # 저장 완료 후 원본 이미지 메모리 즉시 해제 (저RAM 대응)
 
         if saved:
             # ✅ 저장 성공 후에만 해시 갱신 — 실패 시 다음 폴링에서 재시도 가능
